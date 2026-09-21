@@ -23,24 +23,47 @@ Use this prompt on the Start Call or Agent node:
 
 ```
 You are the helpful reception agent for Budha Avenue Banquet Hall.
-This is an incoming phone call. Keep replies short and natural.
+This is an incoming phone call. Keep replies short and natural, and ask one question at a time.
 If customer_found is true, say you found the caller's booking and confirm only their name and event date before discussing it. Never reveal booking details until they confirm their name.
-If customer_found is false, collect an enquiry: name, event date, guest count, event type, hall preference, and whether they want a callback. Do not promise availability, pricing, or a confirmed booking.
+If customer_found is false, collect a booking enquiry. Work through the details the booking form needs, in this order:
+1. Name.
+2. Event date.
+3. Guest count, in number of people.
+4. Event type, such as wedding, reception, birthday, or corporate.
+5. Start time. Convert what they say into 24-hour HH:MM, so "half past seven in the evening" becomes 19:30.
+6. Hall preference: Nirvana, Mandala, Conference, or Lawn.
+7. Food type: Veg or Non-Veg.
+8. Rate plan: Silver, Gold, or Platinum. Describe these as packages only. Never quote a price or a per-plate rate.
+9. Rooms: whether they need only the complimentary room, an additional room, or both. If they want additional rooms, ask how many.
+10. Whether the number they are calling from is also their WhatsApp number, and take the other number if it is different.
+11. Email address.
+12. Whether they would like a callback.
+Ask every one of these, but never invent an answer. If the caller is undecided about the time, hall, food type, rate plan, or rooms, leave that detail out of the tool call and tell them staff will confirm it with them. Do not promise availability, pricing, or a confirmed booking.
+Send the hall, food type, rate plan, and room option using exactly the words listed above, because the CRM rejects any other value.
 Use create_inbound_enquiry only once the caller has given their name, event date, and guest count. Tell them that you have created an enquiry and staff will confirm availability. This adds an Enquiry record directly to the CRM booking list.
 For booking changes, record the request and explain that staff will confirm it.
 ```
 
-Turn on variable extraction at End Call with: `call_outcome`, `summary`, `callback_requested`, `event_date`, and `guest_count`.
+Turn on variable extraction at End Call with: `call_outcome`, `summary`, `callback_requested`, `event_date`, `guest_count`, `event_time`, `hall_preference`, `food_type`, and `rate_plan`.
 
 ## 3. Add the two Dograh HTTP tools
 
 Both tools require the same `X-Dograh-CRM-Key` header credential.
 
-Supported hall preferences are `Nirvana`, `Mandala`, `Conference`, and `Lawn`. Omit the preference if the caller has not chosen; the bridge stores an undecided hall as null and records a staff-confirmation note.
+The bridge accepts only the values the CRM booking form offers, matched case-insensitively so a spoken "gold" or "non veg" still resolves:
+
+| Field | Accepted values |
+| --- | --- |
+| `hall_preference` | `Nirvana`, `Mandala`, `Conference`, `Lawn` |
+| `rate_plan` | `Silver`, `Gold`, `Platinum` |
+| `food_type` | `Veg`, `Non-Veg` (defaults to `Veg` when omitted) |
+| `room_option` | `complimentary`, `additional`, `both` |
+
+Anything else is rejected with a 400 before the booking service is contacted, so the agent must not pass a paraphrase. Omit a field entirely when the caller is undecided: the bridge stores an undecided hall as null, leaves the other fields unset rather than blank, and writes a staff-confirmation note for a missing hall, rate plan, or start time.
 
 | Tool | Method and URL | Parameters |
 | --- | --- | --- |
-| `create_inbound_enquiry` | `POST https://YOUR-CRM/api/dograh/inbound/enquiries` | `caller_number`, `name`, `event_date`, and `guest_count` required; `event_type`, `hall_preference`, `notes`, and `callback_requested` optional |
+| `create_inbound_enquiry` | `POST https://YOUR-CRM/api/dograh/inbound/enquiries` | Required: `caller_number`, `name`, `event_date`, `guest_count`. Optional: `time` (24-hour `HH:MM`), `event_type`, `hall_preference`, `food_type`, `rate_plan`, `room_option`, `complimentary_rooms`, `extra_rooms`, `whatsapp`, `email`, `notes`, `callback_requested` |
 | `save_inbound_call_result` | `POST https://YOUR-CRM/api/dograh/inbound/call-results` | Used by the final webhook, not during the call. |
 
 Add a Webhook node after End Call with URL `https://YOUR-CRM/api/dograh/inbound/call-results` and this payload:
@@ -56,6 +79,8 @@ Configure the same `X-Dograh-CRM-Key` credential on the Webhook node itself. Sav
   "recording_url": "{{recording_url}}"
 }
 ```
+
+The CRM booking form marks `rate_plan` and `food_type` required, but they stay optional on this tool on purpose: a caller who has not chosen a package should still leave an enquiry behind rather than have the tool call fail mid-conversation. Staff complete those fields when they confirm the booking.
 
 ## 4. Route the business number
 

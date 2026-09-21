@@ -16,6 +16,29 @@ function contextObject(value) {
   return parsed;
 }
 
+// The CRM stores these as enums. Match case-insensitively so the speech-to-text
+// casing of a spoken answer ("gold", "non veg") still resolves to a valid value.
+function matchChoice(value, allowed) {
+  const requested = String(value || '').trim();
+  if (!requested) return { requested, value: undefined };
+  const normalise = (text) => text.toLowerCase().replace(/[^a-z]/g, '');
+  return { requested, value: allowed.find((option) => normalise(option) === normalise(requested)) };
+}
+
+function choiceOrFail(res, value, allowed, field) {
+  const { requested, value: matched } = matchChoice(value, allowed);
+  if (requested && !matched) {
+    res.status(400).json({ error: `${field} must be ${allowed.join(', ')}; omit it if the caller is undecided` });
+    return { failed: true };
+  }
+  return { failed: false, value: matched };
+}
+
+function roomCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : undefined;
+}
+
 function requiresDograhKey(req, res, next) {
   const expected = process.env.DOGRAH_CRM_WEBHOOK_SECRET;
   const received = req.get('X-Dograh-CRM-Key');
@@ -66,12 +89,33 @@ exports.createEnquiry = async (req, res) => {
     if (!callerNumber || !req.body.name || !eventDate || !Number.isFinite(guestCount) || guestCount < 1) {
       return res.status(400).json({ error: 'name, caller_number, event_date, and guest_count are required' });
     }
-    const requestedHall = String(req.body.hall_preference || req.body.hallPreference || '').trim();
-    const hall = ['Nirvana', 'Mandala', 'Conference', 'Lawn']
-      .find((value) => value.toLowerCase() === requestedHall.toLowerCase());
-    if (requestedHall && !hall) {
-      return res.status(400).json({ error: 'hall_preference must be Nirvana, Mandala, Conference, or Lawn; omit it if undecided' });
-    }
+    const hallCheck = choiceOrFail(res, req.body.hall_preference || req.body.hallPreference,
+      ['Nirvana', 'Mandala', 'Conference', 'Lawn'], 'hall_preference');
+    if (hallCheck.failed) return;
+    const hall = hallCheck.value;
+
+    // The CRM booking form also requires a rate plan and a food type, and staff
+    // need the start time and room requirement. The agent asks for all of them,
+    // but an undecided caller still gets an enquiry rather than a rejection.
+    const ratePlanCheck = choiceOrFail(res, req.body.rate_plan || req.body.ratePlan,
+      ['Silver', 'Gold', 'Platinum'], 'rate_plan');
+    if (ratePlanCheck.failed) return;
+    const ratePlan = ratePlanCheck.value;
+
+    const foodTypeCheck = choiceOrFail(res, req.body.food_type || req.body.foodType,
+      ['Veg', 'Non-Veg'], 'food_type');
+    if (foodTypeCheck.failed) return;
+    const foodType = foodTypeCheck.value || 'Veg';
+
+    const roomOptionCheck = choiceOrFail(res, req.body.room_option || req.body.roomOption,
+      ['complimentary', 'additional', 'both'], 'room_option');
+    if (roomOptionCheck.failed) return;
+    const roomOption = roomOptionCheck.value;
+
+    const complimentaryRooms = roomCount(req.body.complimentary_rooms ?? req.body.complimentaryRooms);
+    const extraRooms = roomCount(req.body.extra_rooms ?? req.body.extraRooms);
+    const eventTime = String(req.body.time || req.body.event_time || req.body.eventTime || '').trim();
+    const whatsappNumber = String(req.body.whatsapp || req.body.whatsapp_number || '').trim() || callerNumber;
 
     // This uses the same booking-create API as the CRM form.  The record starts
     // as an Enquiry: staff still approve availability, menus, and pricing.
@@ -79,19 +123,26 @@ exports.createEnquiry = async (req, res) => {
       name: req.body.name,
       email: req.body.email,
       number: callerNumber,
-      whatsapp: callerNumber,
+      whatsapp: whatsappNumber,
       pax: guestCount,
       startDate: eventDate,
       // An empty string violates the CRM enum. Null keeps the preference
       // undecided instead of allowing its default to assign Nirvana.
       hall: hall || null,
-      time: req.body.time || '',
+      time: eventTime,
       bookingStatus: 'Enquiry',
       statusHistory: [{ status: 'Enquiry', changedAt: new Date().toISOString() }],
-      foodType: req.body.food_type || 'Veg',
+      foodType,
+      // Omitted rather than blanked: an empty string would fail the CRM enum.
+      ...(ratePlan ? { ratePlan } : {}),
+      ...(roomOption ? { roomOption } : {}),
+      ...(complimentaryRooms === undefined ? {} : { complimentaryRooms }),
+      ...(extraRooms === undefined ? {} : { extraRooms }),
       notes: [
         'Created by Dograh inbound booking agent.',
         !hall ? 'Hall preference not yet selected; staff to confirm.' : '',
+        !ratePlan ? 'Rate plan not yet selected; staff to confirm.' : '',
+        !eventTime ? 'Start time not yet given; staff to confirm.' : '',
         req.body.event_type ? `Event type: ${req.body.event_type}` : '',
         req.body.notes || '',
       ].filter(Boolean).join(' '),
@@ -129,12 +180,19 @@ exports.createEnquiry = async (req, res) => {
 
     const enquiry = await InboundEnquiry.create({
       callerNumber,
+      whatsappNumber,
       name: req.body.name,
       email: req.body.email,
       eventDate,
+      eventTime,
       guestCount,
       eventType: req.body.event_type || req.body.eventType,
       hallPreference: hall,
+      ratePlan,
+      foodType,
+      roomOption,
+      complimentaryRooms,
+      extraRooms,
       notes: req.body.notes,
       callbackRequested: Boolean(req.body.callback_requested || req.body.callbackRequested),
       crmBookingId: booking._id || booking.id,

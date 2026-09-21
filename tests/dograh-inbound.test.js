@@ -123,3 +123,77 @@ test('unrecognized hall is rejected before contacting the booking service', asyn
   } }, res);
   assert.equal(res.statusCode, 400);
 });
+
+const bookingFormEnquiry = {
+  name: 'Test', caller_number: '9876543210', event_date: '2026-12-15', guest_count: 100,
+};
+
+function acceptBooking(inspect) {
+  global.fetch = async (_url, options) => {
+    inspect(JSON.parse(options.body));
+    return { ok: true, json: async () => ({ booking: { _id: 'booking-123' } }) };
+  };
+  InboundEnquiry.create = async (enquiry) => ({ ...enquiry, id: 'enquiry-123' });
+}
+
+test('booking-form answers reach the CRM payload', async () => {
+  let payload;
+  acceptBooking((body) => { payload = body; });
+  const res = response();
+  await controller.createEnquiry({ body: {
+    ...bookingFormEnquiry,
+    hall_preference: 'Nirvana', rate_plan: 'gold', food_type: 'non veg', time: '19:30',
+    whatsapp: '9123456789', room_option: 'both', complimentary_rooms: 2, extra_rooms: 3,
+  } }, res);
+  assert.equal(res.statusCode, 201);
+  assert.equal(payload.ratePlan, 'Gold');
+  assert.equal(payload.foodType, 'Non-Veg');
+  assert.equal(payload.time, '19:30');
+  assert.equal(payload.whatsapp, '9123456789');
+  assert.equal(payload.roomOption, 'both');
+  assert.equal(payload.complimentaryRooms, 2);
+  assert.equal(payload.extraRooms, 3);
+});
+
+test('undecided answers are omitted from the payload and flagged for staff', async () => {
+  let payload;
+  acceptBooking((body) => { payload = body; });
+  const res = response();
+  await controller.createEnquiry({ body: bookingFormEnquiry }, res);
+  assert.equal(res.statusCode, 201);
+  // An empty string would fail the CRM enum, so the key must be absent entirely.
+  assert.equal('ratePlan' in payload, false);
+  assert.equal('roomOption' in payload, false);
+  assert.equal('complimentaryRooms' in payload, false);
+  assert.equal(payload.foodType, 'Veg');
+  assert.equal(payload.whatsapp, bookingFormEnquiry.caller_number);
+  assert.match(payload.notes, /Rate plan not yet selected/);
+  assert.match(payload.notes, /Start time not yet given/);
+});
+
+test('booking-form answers are stored on the enquiry record', async () => {
+  let saved;
+  global.fetch = async () => ({ ok: true, json: async () => ({ booking: { _id: 'booking-123' } }) });
+  InboundEnquiry.create = async (enquiry) => { saved = enquiry; return { ...enquiry, id: 'enquiry-123' }; };
+  const res = response();
+  await controller.createEnquiry({ body: {
+    ...bookingFormEnquiry, rate_plan: 'Platinum', food_type: 'Veg', time: '11:00', extra_rooms: 4,
+  } }, res);
+  assert.equal(res.statusCode, 201);
+  assert.equal(saved.ratePlan, 'Platinum');
+  assert.equal(saved.eventTime, '11:00');
+  assert.equal(saved.extraRooms, 4);
+  assert.equal(saved.whatsappNumber, bookingFormEnquiry.caller_number);
+});
+
+for (const [field, value] of [
+  ['rate_plan', 'Diamond'], ['food_type', 'Vegan'], ['room_option', 'penthouse'],
+]) {
+  test(`unrecognized ${field} is rejected before contacting the booking service`, async () => {
+    global.fetch = async () => assert.fail(`must not send invalid ${field}`);
+    const res = response();
+    await controller.createEnquiry({ body: { ...bookingFormEnquiry, [field]: value } }, res);
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.error, new RegExp(field));
+  });
+}
